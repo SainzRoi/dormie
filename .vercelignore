@@ -1,0 +1,14 @@
+.git
+.venv
+.venv312
+.aws
+.codex
+.agents
+.env
+.env.*
+*.db
+*.db-*
+__pycache__
+.pytest_cache
+node_modules
+tests

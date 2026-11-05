@@ -1,0 +1,15 @@
+.venv/
+.runtime/
+__pycache__/
+.pytest_cache/
+*.db
+*.db-*
+.env
+.env.*
+!.env.example
+.vercel/
+.aws/
+.codex/
+.agents/
+.venv312/
+node_modules/
