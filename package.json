@@ -1,6 +1,0 @@
-{
-  "name": "dorm-together-ui-tests",
-  "private": true,
-  "scripts": {"test": "node --test tests/frontend.test.cjs"},
-  "devDependencies": {"jsdom": ">=16.7.0 <28"}
-}

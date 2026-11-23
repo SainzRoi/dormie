@@ -1,204 +1,242 @@
 import secrets
 from datetime import date
 from typing import Annotated, Literal
-from app.security import hasher
-from argon2.exceptions import VerificationError, InvalidHashError
-from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints
-from sqlalchemy import select
-from app.database import get_db
+from fastapi import APIRouter, Depends, Request
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, StrictBool
+from sqlalchemy import select, text, func
+from app.db import get_db
 from app.models import Resident, Chore, ChoreRating, Availability, Week, Assignment, Delegation, utcnow
-from app.services import chores as svc
+from app.services import core, auth
 
 router = APIRouter(prefix='/api')
-# Equal-cost failure for unknown usernames.
-DUMMY_HASH = hasher.hash(secrets.token_hex(24))
-Text100 = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
+DB = Annotated[object, Depends(get_db)]
+Name = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
+Username = Annotated[str, StringConstraints(strip_whitespace=True, pattern=r'^[a-zA-Z0-9_]{3,40}$')]
 
 class Input(BaseModel):
     model_config = ConfigDict(extra='forbid')
 
 class Credentials(Input):
-    username: Annotated[str, StringConstraints(strip_whitespace=True, to_lower=True, pattern=r'^[a-z0-9_]{3,50}$')]
+    username: Username
     password: str = Field(min_length=8, max_length=128)
 
 class Signup(Credentials):
-    name: Text100
+    name: Name
+
+class Profile(Input):
+    name: Name
 
 class ChoreInput(Input):
-    name: Text100
+    name: Name
     description: str = Field(default='', max_length=2000)
-    frequency: Literal['weekly'] = 'weekly'
     due_weekday: int = Field(ge=1, le=7, strict=True)
+    frequency: Literal['weekly'] = 'weekly'
     is_active: bool = True
 
 class RatingInput(Input):
     intensity_rating: int = Field(ge=1, le=5, strict=True)
 
 class AvailabilityInput(Input):
-    days: list[bool] = Field(min_length=7, max_length=7)
+    days: list[StrictBool] = Field(min_length=7, max_length=7)
 
-class WeekInput(Input):
+class GenerationInput(Input):
     start_date: date
 
 class DelegationInput(Input):
     substitute_resident_id: int
     reason: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=1000)]
 
-class ResponseInput(Input):
+class ResolutionInput(Input):
     status: Literal['accepted', 'rejected', 'cancelled']
 
-def public_resident(r):
-    return dict(resident_id=r.resident_id, name=r.name, username=r.username)
+def write_lock(db):
+    # Serialize writes before domain reads; released by commit/rollback.
+    if db.bind.dialect.name == 'sqlite' and not db.in_transaction():
+        db.execute(text('BEGIN IMMEDIATE'))
+    elif db.bind.dialect.name == 'mysql':
+        db.execute(text('SELECT id FROM app_write_lock WHERE id = 1 FOR UPDATE')).one()
 
-def transaction(request: Request, db=Depends(get_db)):
+def current(request: Request, db: DB):
     if request.method not in ('GET', 'HEAD', 'OPTIONS'):
         expected = request.session.get('csrf')
-        supplied = request.headers.get('X-CSRF-Token', '')
-        if not expected or not secrets.compare_digest(expected, supplied):
-            raise HTTPException(403, 'Invalid CSRF token. Refresh the page and try again.')
-        svc.write_lock(db)
-    try:
-        yield db
-        db.commit()
-    except Exception:
-        db.rollback()
-        raise
+        if not expected or not secrets.compare_digest(request.headers.get('X-CSRF-Token', ''), expected):
+            core.fail('Session security token missing. Reload and try again.', 403)
+        write_lock(db)
+    resident = db.get(Resident, request.session.get('resident_id', -1))
+    if not resident or not resident.is_active:
+        core.fail('Please log in to continue.', 401)
+    return resident
 
-def current(request: Request, db=Depends(transaction)):
-    rid = request.session.get('resident_id')
-    r = db.get(Resident, rid) if rid else None
-    if not r or not r.is_active:
-        raise HTTPException(401, 'Sign in to continue.')
-    return r
+User = Annotated[Resident, Depends(current)]
 
-@router.get('/session')
-def session(request: Request, db=Depends(transaction)):
-    if 'csrf' not in request.session:
-        request.session['csrf'] = secrets.token_urlsafe(32)
-    rid = request.session.get('resident_id')
-    r = db.get(Resident, rid) if rid else None
-    return {'csrf': request.session['csrf'], 'resident': public_resident(r) if r and r.is_active else None}
+def me_data(db, r):
+    availability = db.scalars(select(Availability).where(Availability.resident_id == r.resident_id)).all()
+    rated = db.scalar(select(func.count()).select_from(ChoreRating).join(Chore).where(ChoreRating.resident_id == r.resident_id, Chore.is_active.is_(True)))
+    total = db.scalar(select(func.count()).select_from(Chore).where(Chore.is_active.is_(True)))
+    return {'resident_id': r.resident_id, 'name': r.name, 'username': r.username, 'joined_at': r.joined_at.isoformat() + 'Z',
+            'availability_saved': len(availability) == 7, 'rated_count': rated, 'chore_count': total}
 
-@router.post('/register', status_code=201)
-def register(data: Signup, request: Request, db=Depends(transaction)):
-    if db.scalar(select(Resident).where(Resident.username == data.username)):
-        raise HTTPException(409, 'Username already exists.')
-    r = Resident(name=data.name, username=data.username, password_hash=hasher.hash(data.password))
-    db.add(r)
-    db.flush()
+def establish(request, r):
     request.session.clear()
     request.session.update(resident_id=r.resident_id, csrf=secrets.token_urlsafe(32))
-    return public_resident(r)
 
-@router.post('/login')
-def login(data: Credentials, request: Request, db=Depends(transaction)):
-    r = db.scalar(select(Resident).where(Resident.username == data.username))
-    try:
-        hasher.verify(r.password_hash if r else DUMMY_HASH, data.password)
-    except (VerificationError, InvalidHashError):
-        raise HTTPException(401, 'Incorrect username or password.')
-    if not r or not r.is_active:
-        raise HTTPException(401, 'Incorrect username or password.')
-    request.session.clear()
-    request.session.update(resident_id=r.resident_id, csrf=secrets.token_urlsafe(32))
-    return public_resident(r)
+@router.get('/auth/residents')
+def public_residents(db: DB):
+    # Login identifiers are public; selection alone never authenticates a resident.
+    return [{'resident_id': x.resident_id, 'name': x.name, 'username': x.username} for x in core.active_residents(db)]
 
-@router.post('/logout')
-def logout(request: Request, db=Depends(transaction)):
+@router.post('/auth/signup')
+def signup(data: Signup, request: Request, db: DB):
+    write_lock(db)
+    r = auth.signup(db, data.name, data.username, data.password)
+    db.commit()
+    establish(request, r)
+    return me_data(db, r)
+
+@router.post('/auth/login')
+def login(data: Credentials, request: Request, db: DB):
+    r = auth.authenticate(db, data.username, data.password)
+    establish(request, r)
+    return me_data(db, r)
+
+@router.post('/auth/logout')
+def logout(request: Request, r: User):
     request.session.clear()
-    return {'message': 'Signed out.'}
+    return {'message': 'Logged out.'}
 
 @router.get('/me')
-def me(r=Depends(current)):
-    return public_resident(r)
+def me(request: Request, db: DB, r: User):
+    return {**me_data(db, r), 'csrf': request.session['csrf'], 'today': core.today(), 'current_week': core.monday(core.today())}
 
-@router.get('/chores')
-def catalog(r=Depends(current), db=Depends(transaction)):
-    collective = svc.scores(db)
-    mine = {x.chore_id: x.intensity_rating for x in db.scalars(select(ChoreRating).where(ChoreRating.resident_id == r.resident_id))}
-    return [dict(chore_id=c.chore_id, name=c.name, description=c.description, frequency=c.frequency, due_weekday=c.due_weekday, is_active=c.is_active, mean=collective.get(c.chore_id, (None, 0))[0], count=collective.get(c.chore_id, (None, 0))[1], my_rating=mine.get(c.chore_id)) for c in db.scalars(select(Chore).order_by(Chore.chore_id))]
+@router.patch('/me')
+def profile(data: Profile, db: DB, r: User):
+    r.name = data.name
+    db.commit()
+    return me_data(db, r)
 
-@router.post('/chores', status_code=201)
-def add_chore(data: ChoreInput, r=Depends(current), db=Depends(transaction)):
-    c = Chore(**data.model_dump())
-    db.add(c)
-    db.flush()
-    return {'chore_id': c.chore_id, 'message': 'Chore created. Rate it before generating assignments.'}
-
-@router.put('/chores/{cid}')
-def edit_chore(cid: int, data: ChoreInput, r=Depends(current), db=Depends(transaction)):
-    c = svc.require(db, Chore, cid)
-    if data.due_weekday != c.due_weekday and db.scalar(select(Assignment).where(Assignment.chore_id == cid)):
-        raise HTTPException(409, 'This chore has assignment history. Retire it and create a new chore to change its weekday.')
-    for key, value in data.model_dump().items():
-        setattr(c, key, value)
-    return {'message': 'Chore updated.'}
-
-@router.put('/chores/{cid}/rating')
-def rate(cid: int, data: RatingInput, r=Depends(current), db=Depends(transaction)):
-    svc.require(db, Chore, cid)
-    rating = db.scalar(select(ChoreRating).where(ChoreRating.chore_id == cid, ChoreRating.resident_id == r.resident_id))
-    if not rating:
-        rating = ChoreRating(chore_id=cid, resident_id=r.resident_id)
-        db.add(rating)
-    rating.intensity_rating, rating.rated_at = data.intensity_rating, utcnow()
-    return {'message': 'Rating saved. Existing assignment scores remain unchanged.'}
+@router.get('/residents')
+def directory(db: DB, r: User):
+    return [{'resident_id': x.resident_id, 'name': x.name} for x in core.active_residents(db)]
 
 @router.get('/availability')
-def availability(r=Depends(current), db=Depends(transaction)):
-    rows = {a.weekday: a.is_available for a in db.scalars(select(Availability).where(Availability.resident_id == r.resident_id))}
-    return {'days': [rows.get(i, False) for i in range(1, 8)], 'configured_days': len(rows)}
+def get_availability(db: DB, r: User):
+    saved = {a.weekday: a.is_available for a in db.scalars(select(Availability).where(Availability.resident_id == r.resident_id))}
+    return {'days': [saved.get(d, False) for d in range(1, 8)]}
 
 @router.put('/availability')
-def set_availability(data: AvailabilityInput, r=Depends(current), db=Depends(transaction)):
-    for day, available in enumerate(data.days, 1):
+def availability(data: AvailabilityInput, db: DB, r: User):
+    for day, value in enumerate(data.days, 1):
         a = db.scalar(select(Availability).where(Availability.resident_id == r.resident_id, Availability.weekday == day))
-        if not a:
-            a = Availability(resident_id=r.resident_id, weekday=day)
-            db.add(a)
-        a.is_available = available
-    return {'message': 'Recurring availability saved for future generation.'}
+        if a:
+            a.is_available = value
+        else:
+            db.add(Availability(resident_id=r.resident_id, weekday=day, is_available=value))
+    db.commit()
+    return {'days': data.days}
+
+@router.get('/chores')
+def chores(db: DB, r: User):
+    means = core.scores(db)
+    own = {x.chore_id: x.intensity_rating for x in db.scalars(select(ChoreRating).where(ChoreRating.resident_id == r.resident_id))}
+    return [{'chore_id': c.chore_id, 'name': c.name, 'description': c.description, 'due_weekday': c.due_weekday, 'frequency': c.frequency, 'is_active': c.is_active,
+             'mean': means.get(c.chore_id, (None, 0))[0], 'rating_count': means.get(c.chore_id, (None, 0))[1], 'my_rating': own.get(c.chore_id)}
+            for c in db.scalars(select(Chore).order_by(Chore.chore_id))]
+
+@router.post('/chores')
+def create_chore(data: ChoreInput, db: DB, r: User):
+    c = Chore(**data.model_dump())
+    db.add(c)
+    db.commit()
+    return {'chore_id': c.chore_id}
+
+@router.put('/chores/{cid}')
+def update_chore(cid: int, data: ChoreInput, db: DB, r: User):
+    c = core.require(db, Chore, cid)
+    if c.due_weekday != data.due_weekday and db.scalar(select(Assignment.assignment_id).where(Assignment.chore_id == cid).limit(1)):
+        core.fail('This chore has assignment history. Retire it and create a new chore to change its due weekday.', 409)
+    for key, value in data.model_dump().items():
+        setattr(c, key, value)
+    db.commit()
+    return {'chore_id': cid}
+
+@router.put('/chores/{cid}/rating')
+def rate(cid: int, data: RatingInput, db: DB, r: User):
+    chore = core.require(db, Chore, cid)
+    if not chore.is_active:
+        core.fail('Retired chores cannot receive new or updated ratings.', 409)
+    row = db.scalar(select(ChoreRating).where(ChoreRating.resident_id == r.resident_id, ChoreRating.chore_id == cid))
+    if not row:
+        row = ChoreRating(resident_id=r.resident_id, chore_id=cid)
+        db.add(row)
+    row.intensity_rating, row.rated_at = data.intensity_rating, utcnow()
+    db.commit()
+    return {'intensity_rating': row.intensity_rating}
 
 @router.get('/weeks')
-def weeks(r=Depends(current), db=Depends(transaction)):
-    return [{'start_date': w.start_date, 'end_date': w.end_date, 'week_id': w.week_id} for w in db.scalars(select(Week).order_by(Week.start_date.desc()))]
+def weeks(db: DB, r: User):
+    return [{'week_id': w.week_id, 'start_date': w.start_date, 'end_date': w.end_date} for w in db.scalars(select(Week).order_by(Week.start_date.desc()))]
+
+@router.post('/weeks/generate')
+def generate(data: GenerationInput, db: DB, r: User):
+    if data.start_date < core.monday(core.today()):
+        core.fail('Generate the current or an upcoming week. Past weeks are read-only for generation.', 422)
+    result = core.generate(db, data.start_date)
+    db.commit()
+    return result
 
 @router.get('/assignments')
-def assignments(start_date: date, r=Depends(current), db=Depends(transaction)):
-    svc.validate_week(start_date)
-    rows = svc.assignment_rows(db, start_date)
-    assigned = {a['chore_id'] for a in rows}
-    score = svc.scores(db)
-    warnings = [f'{c.name}: unassigned' + (' — needs at least one active-resident rating.' if c.chore_id not in score else ' — generate missing chores after checking availability.') for c in db.scalars(select(Chore).where(Chore.is_active.is_(True))) if c.chore_id not in assigned]
-    return {'assignments': rows, 'warnings': warnings}
+def assignments(start: date, db: DB, r: User):
+    core.validate_week(start)
+    return [core.assignment_data(db, a) for a in db.scalars(select(Assignment).join(Week).where(Week.start_date == start).order_by(Assignment.due_date, Assignment.assignment_id))]
 
-@router.post('/assignments/generate')
-def generate(data: WeekInput, r=Depends(current), db=Depends(transaction)):
-    return svc.generate(db, data.start_date)
+@router.get('/assignments/{aid}')
+def assignment(aid: int, db: DB, r: User):
+    return core.assignment_data(db, core.require(db, Assignment, aid))
 
 @router.post('/assignments/{aid}/complete')
-def complete(aid: int, r=Depends(current), db=Depends(transaction)):
-    return svc.complete(db, aid, r.resident_id)
+def complete(aid: int, db: DB, r: User):
+    a = core.complete(db, aid, r.resident_id)
+    db.commit()
+    return core.assignment_data(db, a)
 
-@router.post('/assignments/{aid}/delegations', status_code=201)
-def delegate(aid: int, data: DelegationInput, r=Depends(current), db=Depends(transaction)):
-    return svc.request_delegation(db, aid, r.resident_id, data.substitute_resident_id, data.reason)
+@router.get('/assignments/{aid}/substitutes')
+def substitutes(aid: int, db: DB, r: User):
+    a = core.require(db, Assignment, aid)
+    if a.resident_id != r.resident_id:
+        core.fail('Only the original assignee may review substitutes.', 403)
+    week = core.require(db, Week, a.week_id)
+    points = {x['resident_id']: x['weekly']['actual'] for x in core.stats(db, week.start_date)}
+    return [{'resident_id': x.resident_id, 'name': x.name, 'points': points[x.resident_id]} for x in core.eligible_substitutes(db, a)]
+
+@router.post('/assignments/{aid}/delegations')
+def delegate(aid: int, data: DelegationInput, db: DB, r: User):
+    d = core.request_delegation(db, aid, r.resident_id, data.substitute_resident_id, data.reason)
+    db.commit()
+    return {'delegation_id': d.delegation_id, 'status': d.status}
 
 @router.get('/delegations')
-def delegations(r=Depends(current), db=Depends(transaction)):
-    rows = []
-    for d in db.scalars(select(Delegation).order_by(Delegation.delegation_id.desc())):
-        a = db.get(Assignment, d.assignment_id)
-        if r.resident_id not in (a.resident_id, d.substitute_resident_id):
-            continue
-        rows.append(dict(delegation_id=d.delegation_id, assignment_id=a.assignment_id, chore=db.get(Chore, a.chore_id).name, original=db.get(Resident, a.resident_id).name, original_id=a.resident_id, substitute=db.get(Resident, d.substitute_resident_id).name, substitute_id=d.substitute_resident_id, due_date=a.due_date, reason=d.reason, status=d.status, delegated_at=d.delegated_at))
-    return rows
+def delegations(db: DB, r: User):
+    rows = db.execute(select(Delegation, Assignment).join(Assignment).where((Delegation.substitute_resident_id == r.resident_id) | (Assignment.resident_id == r.resident_id)).order_by(Delegation.delegation_id.desc())).all()
+    return [{'delegation_id': d.delegation_id, 'assignment_id': a.assignment_id, 'name': core.require(db, Chore, a.chore_id).name,
+             'original_name': core.require(db, Resident, a.resident_id).name, 'substitute_name': core.require(db, Resident, d.substitute_resident_id).name,
+             'resident_id': a.resident_id, 'substitute_resident_id': d.substitute_resident_id, 'reason': d.reason, 'status': d.status,
+             'due_date': a.due_date, 'workload_points': a.workload_points, 'delegated_at': d.delegated_at.isoformat()+'Z'} for d, a in rows]
 
-@router.post('/delegations/{did}/respond')
-def respond(did: int, data: ResponseInput, r=Depends(current), db=Depends(transaction)):
-    return svc.respond(db, did, r.resident_id, data.status)
+@router.patch('/delegations/{did}')
+def resolve(did: int, data: ResolutionInput, db: DB, r: User):
+    d = core.resolve_delegation(db, did, r.resident_id, data.status)
+    db.commit()
+    return {'status': d.status}
 
 @router.get('/statistics')
-def statistics(start_date: date, r=Depends(current), db=Depends(transaction)):
-    return svc.statistics(db, start_date)
+def statistics(start: date, db: DB, r: User):
+    return core.stats(db, start)
+
+@router.get('/residents/{rid}/status')
+def resident_status(rid: int, start: date, db: DB, r: User):
+    viewed = core.require(db, Resident, rid)
+    if not viewed.is_active:
+        core.fail('Resident is inactive.', 404)
+    result = next(x for x in core.stats(db, start) if x['resident_id'] == rid)
+    tasks = assignments(start, db, r)
+    return {**result, 'joined_at': viewed.joined_at.isoformat()+'Z', 'assignments': [a for a in tasks if a['responsible_id'] == rid or a['resident_id'] == rid]}

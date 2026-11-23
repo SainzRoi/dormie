@@ -1,117 +1,157 @@
-# DormTogether · DS 187
+# Dormie
 
-A local-first dormitory chore assignment and monitoring application implementing [the project specification](DS187_Codex_Project_Spec.md). FastAPI, SQLAlchemy 2, Alembic, SQLite, a Jinja-served application shell, and lightweight browser JavaScript. No external services or frontend build are needed to run it.
+A local-first dormitory chore manager with a pixel-art common room, resident carousel, deterministic workload balancing, and one shared backend for desktop and mobile.
 
-New to the project? Read [the simple program guide](PROGRAM_GUIDE.md) for the everyday workflow, code map, and assignment example.
+## Install and run
 
-To share the app online, follow [the GitHub + Vercel deployment guide](DEPLOYMENT.md). Hosted use requires PostgreSQL; local use keeps SQLite.
+Requires **Python 3.12+ and MySQL 8.0.16+** (MySQL 8.4 recommended). No Node build is needed.
 
-## Setup and run
+First, open MySQL as an administrator (`mysql -u root -p`) and create the database and local application user. Replace the example password:
 
-Requires **Python 3.12+** and internet access for the initial dependency installation. Run from this project directory on Linux/macOS:
+```sql
+CREATE DATABASE dormie CHARACTER SET utf8mb4 COLLATE utf8mb4_bin;
+CREATE USER 'dormie'@'localhost' IDENTIFIED BY 'replace-me';
+GRANT ALL PRIVILEGES ON dormie.* TO 'dormie'@'localhost';
+```
+
+Then run from this project directory:
 
 ```bash
+# Skip creating the virtual environment if .venv already exists.
 python3.12 -m venv .venv
 source .venv/bin/activate
-python -m pip install -r requirements.txt
-cp .env.example .env
-python -c "import secrets; from pathlib import Path; p=Path('.env'); p.write_text(p.read_text().replace('replace-with-a-random-secret-at-least-32-characters', secrets.token_hex(32)))"
-set -a
-source .env
-set +a
+python -m pip install -r requirements.lock.txt
+export DATABASE_URL='mysql+pymysql://dormie:replace-me@127.0.0.1:3306/dormie?charset=utf8mb4'
 python -m alembic upgrade head
 python -m app.seed
-python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
-Open **http://127.0.0.1:8000**. API documentation is at `/docs`; a liveness endpoint is at `/health`. The database is `dorm.db` in the project directory. The `.env` file is loaded by the shell commands above, not automatically by the application. Repeat the activation and `source` commands in a new terminal. A missing session secret generates an ephemeral development key, so restarting then signs residents out.
+Use your actual password in the URL; URL-encode special characters in the username/password. Set `DATABASE_URL` in each terminal that runs the application or migrations. `.env.example` is a reference; `.env` files are **not automatically loaded**. Without `DATABASE_URL`, the app retains its SQLite fallback (`dormie.db`). Existing SQLite data is not copied to MySQL; the seed creates a fresh demo and preserves an already populated database.
 
-This machine’s default Python may be 3.10. A cached Codex Python 3.12 was found at `/home/roi/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3.12`; it can replace `python3.12` in the first command on this machine. That path is not required on other machines.
+Open **http://127.0.0.1:8000**; API documentation is at **http://127.0.0.1:8000/docs**. Stop with Ctrl+C. On Windows PowerShell, activate with `.venv\Scripts\Activate.ps1` and set the URL with `$env:DATABASE_URL = 'mysql+pymysql://...'`.
 
-For HTTPS hosting, set `COOKIE_SECURE=true`. This version is intended for a local classroom demonstration, not public internet deployment.
-
-## Demo accounts and dates
-
-| Resident | Username | Password |
-|---|---|---|
-| Alex | `alex` | `DormDemo2026!` |
-| Bea | `bea` | `DormDemo2026!` |
-| Carlo | `carlo` | `DormDemo2026!` |
-| Dana | `dana` | `DormDemo2026!` |
-
-The idempotent seed creates four chores, the specified ratings with means **2.00, 3.00, 4.50, and 3.50**, recurring availability, four completed historical weeks beginning October 12, 2026, and pending assignments for **November 9–15, 2026**. Seed dates and allocation history are fixed independently of the computer clock. Repeating the command preserves existing edits and assignments.
-
-An optional separate command demonstrates one accepted delegation without completing the chore:
+To inspect the MySQL database in MySQL Workbench, connect to `127.0.0.1:3306` as `dormie`, then refresh Schemas. Or use:
 
 ```bash
-python -m app.seed --delegation
+mysql -h 127.0.0.1 -u dormie -p dormie
 ```
 
-It preserves the original assignee and is idempotent. Run the main seed first. Use a fresh database for an untouched classroom fixture; do not delete a database containing work you want to keep.
+```sql
+SHOW TABLES;
+SHOW CREATE TABLE assignment;
+DESCRIBE resident;
+SELECT resident_id, name, username FROM resident;
+```
 
-## Classroom walkthrough
+Always create the MySQL schema through Alembic, not `Base.metadata.create_all()`: migrations install the generated-column unique index, date/history triggers, and `app_write_lock` infrastructure table. This row serializes application writes transactionally, including generation and delegation/completion races. MySQL uses InnoDB, strict SQL mode, and READ COMMITTED isolation. Keep MySQL's strict SQL mode enabled. MySQL coerces fractional inputs stored in INT columns; the API rejects non-integer ratings/weekdays before storage (the SQLite-only raw fractional-value test is skipped on MySQL). Seven domain tables remain, plus Alembic version tracking and the write-lock table.
 
-1. Sign in as `alex`. Change “Week beginning” to **2026-11-09**. Review the overview, onboarding checklist, and points.
-2. Open **Chores & ratings**. Show the bathroom’s **4.50** collective score and four ratings. Edit a rating, then show that existing assignments retain their frozen points.
-3. Open **My availability**. Save seven recurring weekday choices. Explain that these persist across weeks and missing days are unavailable.
-4. In **Weekly assignments**, expand an assignment rationale to explain availability, historical average, planned points, and tie-breaks.
-5. Select a current or future Monday and click **Generate missing assignments**. Click again to demonstrate idempotency. An unrated active chore blocks generation; a chore with no eligible residents stays unassigned with a warning.
-6. For a pending chore, sign in as its original assignee, select an available substitute, and enter a reason. Sign out and sign in as that substitute. Accept in **Delegations**. Show the original assignee remains recorded. Reject or cancel another pending request to demonstrate preserved history.
-7. Mark the accepted chore completed as the substitute. The original assignee cannot do so after transfer.
-8. Open **Workload statistics**. Compare original, actual, and completed weekly totals, all-time cumulative totals, eligible-week averages, and the four-week chart. All residents appear, including those with zero points.
+Set `SECRET_KEY` to a random secret for stable sessions across restarts. Without it, restarting signs everyone out. Set `COOKIE_SECURE=1` only behind HTTPS.
 
-If demonstrating after November 2026, the seeded week remains viewable and its pending chores/delegations remain actionable. Generate new chores only for the current or future weeks.
+SQLite remains available for local tests or an isolated demo:
+
+```bash
+export DATABASE_URL=sqlite:///./classroom-demo.db
+python -m alembic upgrade head
+python -m app.seed
+python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+```
+
+## Demonstration accounts
+
+| Resident | Username | Password |
+| --- | --- | --- |
+| Alex | `alex` | `Dormie2026!` |
+| Bea | `bea` | `Dormie2026!` |
+| Carlo | `carlo` | `Dormie2026!` |
+| Dana | `dana` | `Dormie2026!` |
+
+The seed uses the fixed **November 9–15, 2026** demonstration week and four earlier completed weeks (October 12–November 8). Seeded ratings are exactly those specified in Part 5: Sweep floor 2.00, Wash dishes 3.00, Clean bathroom 4.50, Mop floor 3.50.
+
+The UI defaults to the actual current Monday in Asia/Manila. **Choose November 9, 2026 in the week picker to inspect the fixed demo.** It is deliberately not presented as the current week. The seed command is non-destructive and does nothing if any resident already exists.
+
+For a fresh, isolated classroom dataset, choose a new database filename instead of deleting existing work:
+
+```bash
+export DATABASE_URL=sqlite:///./classroom-demo.db
+python -m alembic upgrade head
+python -m app.seed
+python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+```
+
+Choose an unused filename; seeding preserves an already populated database.
+
+## Classroom demonstration (10–15 minutes)
+
+1. **Welcome and identity.** Open the title screen. Select Resident login, choose Alex, and authenticate. Selecting a login profile only prefills the username; a password is still required.
+2. **Desktop resident browsing.** At 1440 × 900, choose November 9, 2026. Alex is centered and both panels start closed. Use arrows or focus the stage and use Left/Right. Click Bea to open Resident Info and Current Status around the character. The account button still says Alex. Browse with panels open, press Escape, and reopen a character.
+3. **Mobile controls.** Resize to 390 × 844. The selected resident, week, and details state remain the same. Collapse the sheet to see the full-body character. Swipe the character horizontally or tap arrows. Drag the sheet handle up/down, or use Expand details/Collapse. Scroll the expanded sheet body independently. Return to my status selects Alex without logging in again.
+4. **Ratings and availability.** Open Chores & Ratings. Inspect all four exact means and four ratings per chore. Change one of Alex’s ratings and save; the collective mean changes, but historical assignment points remain frozen. Open My Availability, change a weekday, and save. Explain that these booleans repeat every week and existing assignments are preserved.
+5. **Explain an assignment.** Open Assignments, select the fixed demo week, and open Clean bathroom → Details → Why this assignment? The stored explanation includes score, rating count, available weekday, historical average, prior planned points, candidate burdens, and tie-break order.
+6. **Accepted transfer and completion.** In the untouched seed, Carlo originally received Clean bathroom (4.50 pts), and Alex is its accepted substitute. Original assignment stays Carlo’s; actual responsibility belongs to Alex. Complete it as Alex and confirm. Completed workload becomes 4.50 for Alex from this chore. Reopening shows the Manila completion timestamp.
+7. **Pending request.** The seed has Dana’s Mop floor request pending for Alex. Open Delegations as Alex and accept or reject it. A pending request does not transfer responsibility; acceptance does, and is not task completion. Sign in as Dana separately to demonstrate cancellation on a fresh dataset.
+8. **Request lifecycle.** Sign in as Bea. On the demo week, Wash dishes is pending with no active request. Open its details and Request substitute; choose an eligible resident and supply a reason. Show Incoming/Outgoing/History from each account. After rejection or cancellation, create a new request. After acceptance, no further delegation is allowed.
+9. **Generation.** Select the current or an upcoming Monday in Assignments. Generate and confirm; review assignments and explanations. Generate again to show zero new assignments and unchanged owners. Add an unrated chore to demonstrate the blocking error, rate it, and retry. To demonstrate an unassigned warning, all residents must explicitly be unavailable on that chore’s due weekday; generation never invents availability.
+10. **Statistics and policies.** Explore all three metrics, four period options, and resident/group filters. Show the accessible data table and zero-point residents. Open Dorm Rules → Quiet hours and show that policies are pending approval.
+11. **New resident.** Log out, register a new account, save recurring weekdays, review ratings, and finish setup. No fictitious points are awarded. Resume setup is available under My Profile.
 
 ## Tests
 
-After installing dependencies:
+Run the service/API/migration/concurrency suite:
 
 ```bash
+source .venv/bin/activate
 python -m pytest -q
 ```
 
-The integration tests apply Alembic migrations to a separate temporary SQLite database for each test. They cover authentication, CSRF, ownership, validation, generation, delegation, reporting views, migration constraints, and concurrent generation. They never use `dorm.db`.
-
-The framework-independent database/service suite can also be run alone:
+To run the same service, API, and concurrency tests on MySQL, set a test account URL. The account must be allowed to create and drop databases. Each test creates its own randomly named `dormie_test_*` database and removes only that database afterward; the existing application database is untouched. The SQLite migration regression test still runs separately.
 
 ```bash
-python -m unittest tests.test_domain -v
+export MYSQL_TEST_URL='mysql+pymysql://test_user:password@127.0.0.1:3306/?charset=utf8mb4'
+python -m pytest -q
+unset MYSQL_TEST_URL
 ```
 
-Optional UI behavior tests (Node.js 18+):
+Run the browser suite (optional development dependency):
 
 ```bash
-npm install
-npm test
+python -m pip install -r requirements-dev.txt
+python -m playwright install chromium
+python scripts/browser_check.py
 ```
 
-These use JSDOM and fixture API responses to test page rendering, escaping, recurring-availability and rating submissions, and authentication UI. They do not replace real-browser or HTTP integration testing. Node is not required to run the application.
+If Google Chrome or Chromium is installed, the script uses it automatically. Set `CHROME_PATH` to select another compatible executable. Otherwise it uses Playwright’s installed Chromium. The script launches its own server on a free loopback port, migrates and seeds a temporary database, executes workflows, saves screenshots/results to `artifacts/`, and stops its server. **It does not alter `dormie.db`.**
 
-**Verification in the implementation environment:** 29 real SQLite service/model/seed tests passed under Python 3.12 using locally cached dependencies. See [VERIFICATION.md](VERIFICATION.md) for the exact commands, UI test result, and blocked checks. FastAPI/Alembic installation was blocked by network/DNS restrictions, so full HTTP tests, actual migration execution, and application launch have not been verified here. Do not interpret the service tests as passing the entire acceptance checklist.
+See [TEST_RESULTS.md](TEST_RESULTS.md) for executed results and [docs/BROWSER_CHECKLIST.md](docs/BROWSER_CHECKLIST.md) for repeatable manual checks. Browser verification uses Chromium emulation; physical touchscreen devices and other browser engines require separate validation.
 
-## Behavior and architecture
+## Project map
 
-- Seven domain tables: resident, chore, chore_rating, week, availability, assignment, delegation. Alembic also maintains its infrastructure version table. `weekly_workload` is a SQL view, not a history table.
-- Only weekly chores; weekdays are 1=Monday to 7=Sunday. All timestamps originate in UTC and display in Asia/Manila.
-- Residents may manage shared chores. Retiring preserves history. A chore with assignment history cannot have its weekday changed; retire it and create a replacement.
-- Generation snapshots the average of active residents’ ratings. Unrated active chores block the entire generation action.
-- Chores sort by descending score, then ID. Candidates must be active, joined by the due date, and explicitly available. The chosen candidate minimizes **historical average + current-week responsibility points**, then target-week chore count, then resident ID.
-- History uses the previous four calendar weeks that have ended before both today and the selected target week. Zero-work weeks count; weeks before joining do not. “Ended” describes the calendar week, not whether every task was completed.
-- Current/future-week generation fills missing chores without reshuffling. Writes reserve the SQLite write lock before reading decision state; uniqueness constraints provide a second guard against duplicates.
-- A pending delegation does not transfer responsibility. Acceptance transfers points without changing the original assignee or marking completion. Accepted delegations cannot be chained. Completing the original task cancels any still-pending request.
-- Weekly reporting is selected-week specific. Cumulative reporting is all recorded weeks, including planned assignments. Average denominator spans the first recorded week or joining week (whichever is later) through the later of the selected week and latest recorded week, including zero-work weeks.
+- `app/models/`: seven SQLAlchemy domain models and relational constraints.
+- `alembic/versions/`: explicit schema migration and SQLite cross-table due-date guards.
+- `app/services/`: authentication, scoring, allocator, responsibility resolution, delegation/completion, reporting queries.
+- `app/api/`: Pydantic inputs and protected API routes.
+- `app/templates/index.html`: Jinja2 document shell.
+- `app/static/`: responsive CSS, vanilla JavaScript, separate original SVG artwork.
+- `app/seed.py`: deterministic, non-destructive classroom data.
+- `tests/`: temporary-database service/API, migration and concurrency tests.
+- `scripts/create_assets.py`: reproducible original pixel artwork source.
+- `scripts/browser_check.py`: isolated browser walkthrough and screenshots.
+- `DECISIONS.md`: calendar, fairness, persistence, security and scope decisions.
 
-```text
-app/models/         Seven SQLAlchemy models and constraints
-app/services/       Allocation, reporting, completion, delegation rules
-app/api/            Validated REST endpoints and authorization
-app/templates/      Accessible application shell
-app/static/         Responsive styles and browser behavior
-app/seed.py         Fixed demo data and optional delegation
-alembic/            Initial schema migration, view and SQLite triggers
-tests/              Service, HTTP integration and UI behavior tests
-```
+## Main API surface
 
-Session cookies are signed, HttpOnly, SameSite=Strict, and expire after eight hours. All mutations, including login, require a CSRF token from `GET /api/session`, supplied as `X-CSRF-Token`. Passwords are Argon2id hashes. Request models reject unexpected fields; resident IDs for ratings and availability always come from the authenticated session.
+Authentication: `POST /api/auth/signup`, `/api/auth/login`, `/api/auth/logout`; `GET /api/me`; `PATCH /api/me`. Public `GET /api/auth/residents` exposes only login identifiers and names. Other endpoints require authentication.
 
-For implementation choices and limitations, see [DECISIONS.md](DECISIONS.md). Framework references: [SQLAlchemy SQLite constraints and partial indexes](https://docs.sqlalchemy.org/en/20/dialects/sqlite.html), [Starlette session middleware](https://www.starlette.io/middleware/).
+Shared data: `GET /api/residents`; `GET /api/residents/{id}/status?start=YYYY-MM-DD`; `GET /api/chores`; `POST /api/chores`; `PUT /api/chores/{id}`; `PUT /api/chores/{id}/rating`.
+
+Scheduling: `GET/PUT /api/availability`; `GET /api/weeks`; `POST /api/weeks/generate`; `GET /api/assignments?start=YYYY-MM-DD`; `GET /api/assignments/{id}`; `POST /api/assignments/{id}/complete`.
+
+Delegation: `GET /api/assignments/{id}/substitutes`; `POST /api/assignments/{id}/delegations`; `GET /api/delegations`; `PATCH /api/delegations/{id}`. Statistics: `GET /api/statistics?start=YYYY-MM-DD`.
+
+For authenticated writes, copy the CSRF token returned by `GET /api/me` into the `X-CSRF-Token` header and retain the session cookie. Request bodies use JSON. Ratings and availability endpoints always address the authenticated resident; they accept no arbitrary resident ID.
+
+## Scope
+
+One dormitory, resident-only access, weekly chores, weekday availability, self-reported completion, and static unapproved rules. No admin roles, room database, timetables, durations, XP, photo verification, notifications table, or workload-history table. See [DECISIONS.md](DECISIONS.md) for remaining limitations.
+
+MySQL implementation references: [SQLAlchemy MySQL dialect](https://docs.sqlalchemy.org/en/20/dialects/mysql.html), [generated columns](https://dev.mysql.com/doc/refman/8.4/en/create-table-generated-columns.html), and [unique indexes](https://dev.mysql.com/doc/refman/8.4/en/create-index.html).

@@ -1,181 +1,108 @@
-"""HTTP integration tests; migrate a fresh database for every test."""
-from datetime import date, datetime, timedelta, timezone
-from concurrent.futures import ThreadPoolExecutor
-import pytest
-from alembic import command
-from alembic.config import Config
-from fastapi.testclient import TestClient
-from sqlalchemy import select, text, inspect
-from sqlalchemy.orm import Session
-from app.main import app
-from app.database import get_db, make_engine
-from app.models import Resident, Chore, Assignment, Availability, ChoreRating
-from app.services.chores import monday, MANILA, weekly_totals
+from datetime import date, timedelta
+from sqlalchemy import select, func
+from app.models import *
+from app.services import core
 
-@pytest.fixture
-def setup(tmp_path):
-    engine=make_engine('sqlite:///'+str(tmp_path/'integration.db'))
-    config=Config('alembic.ini')
-    with engine.begin() as connection:
-        config.attributes['connection']=connection
-        command.upgrade(config,'head')
-    def database():
-        with Session(engine, expire_on_commit=False) as db:
-            yield db
-    app.dependency_overrides[get_db]=database
-    with TestClient(app) as client:
-        yield client, engine
-    app.dependency_overrides.clear()
-    engine.dispose()
+def test_auth_signup_login_logout(client):
+    assert client.get('/api/me').status_code==401
+    assert client.post('/api/auth/signup',json={'name':'New','username':'new','password':'short'}).status_code==422
+    response=client.post('/api/auth/signup',json={'name':'New Resident','username':'new','password':'Password123'})
+    assert response.status_code==200
+    me=client.get('/api/me').json()
+    assert 'password_hash' not in me
+    assert me['availability_saved'] is False
+    assert client.post('/api/auth/signup',json={'name':'Same','username':'NEW','password':'Password123'}).status_code==409
+    assert client.post('/api/auth/logout',headers={'X-CSRF-Token':me['csrf']}).status_code==200
+    assert client.get('/api/me').status_code==401
+    assert client.post('/api/auth/login',json={'username':'new','password':'WrongPassword'}).status_code==401
+    assert client.post('/api/auth/login',json={'username':'new','password':'Password123'}).status_code==200
 
-def mutate(client, path, body=None, method='POST'):
-    token=client.get('/api/session').json()['csrf']
-    return client.request(method,path,json=body,headers={'X-CSRF-Token':token})
-
-def register(client,name='alex'):
-    response=mutate(client,'/api/register',{'name':name.title(),'username':name,'password':'TestPassword123!'})
-    assert response.status_code==201,response.text
-    return response.json()['resident_id']
-
-def login(client,name):
-    assert mutate(client,'/api/login',{'username':name,'password':'TestPassword123!'}).status_code==200
-
-def prepare(client):
-    for name in ['alex','bea']:
-        register(client,name)
-        assert mutate(client,'/api/availability',{'days':[True]*7},'PUT').status_code==200
-    login(client,'alex')
-    cid=mutate(client,'/api/chores',{'name':'Bathroom','due_weekday':4}).json()['chore_id']
-    assert mutate(client,f'/api/chores/{cid}/rating',{'intensity_rating':5},'PUT').status_code==200
-    week=monday(datetime.now(MANILA).date())+timedelta(weeks=1)
-    response=mutate(client,'/api/assignments/generate',{'start_date':str(week)})
-    assert response.status_code==200,response.text
-    return cid,week,response.json()['assignments'][0]
-
-def test_auth_csrf_and_password_hash(setup):
-    c,engine=setup
-    assert c.get('/api/me').status_code==401
-    assert c.post('/api/register',json={'username':'alex','name':'Alex','password':'12345678'}).status_code==403
-    rid=register(c)
-    assert c.get('/api/me').json()['resident_id']==rid
-    with Session(engine) as db:
-        assert db.get(Resident,rid).password_hash.startswith('$argon2id$')
-    assert 'httponly' in c.get('/api/session').headers['set-cookie'].lower()
-    assert mutate(c,'/api/logout').status_code==200
-    assert c.get('/api/me').status_code==401
-    assert mutate(c,'/api/login',{'username':'alex','password':'WrongPass123'}).status_code==401
-    login(c,'alex')
-
-def test_registration_duplicate_and_input_validation(setup):
-    c,_=setup
-    register(c)
-    assert mutate(c,'/api/register',{'username':'alex','name':'Other','password':'TestPassword123!'}).status_code==409
-    assert mutate(c,'/api/chores',{'name':'','due_weekday':8}).status_code==422
-    assert mutate(c,'/api/chores',{'name':'Daily','due_weekday':1,'frequency':'daily'}).status_code==422
-
-def test_ratings_availability_ownership_and_validation(setup):
-    c,engine=setup
-    alex=register(c)
-    cid=mutate(c,'/api/chores',{'name':'Sweep','due_weekday':1}).json()['chore_id']
+def test_rating_validation_upsert_security(client,login,populated):
     for value in [0,6,2.5,True]:
-        assert mutate(c,f'/api/chores/{cid}/rating',{'intensity_rating':value},'PUT').status_code==422
-    assert mutate(c,f'/api/chores/{cid}/rating',{'intensity_rating':5},'PUT').status_code==200
-    assert mutate(c,f'/api/chores/{cid}/rating',{'intensity_rating':4},'PUT').status_code==200
-    bea=register(c,'bea')
-    assert mutate(c,f'/api/chores/{cid}/rating',{'intensity_rating':1,'resident_id':alex},'PUT').status_code==422
-    assert mutate(c,'/api/availability',{'days':[False]*7,'resident_id':alex},'PUT').status_code==422
-    assert mutate(c,'/api/availability',{'days':[True]},'PUT').status_code==422
-    assert mutate(c,'/api/availability',{'days':[True]*7},'PUT').status_code==200
-    with Session(engine) as db:
-        rows=list(db.scalars(select(ChoreRating)))
-        assert len(rows)==1 and rows[0].resident_id==alex and rows[0].intensity_rating==4
-        assert all(a.resident_id==bea for a in db.scalars(select(Availability)))
+        assert client.put('/api/chores/3/rating',json={'intensity_rating':value}).status_code==422
+    for value in [1,5,4]:
+        assert client.put('/api/chores/3/rating',json={'intensity_rating':value}).status_code==200
+    assert client.put('/api/chores/3/rating',json={'intensity_rating':3,'resident_id':2}).status_code==422
+    populated.expire_all()
+    ratings=populated.scalars(select(ChoreRating).where(ChoreRating.chore_id==3)).all()
+    assert len(ratings)==4
+    assert next(r for r in ratings if r.resident_id==2).intensity_rating==4
+    assert client.get('/api/chores').json()[2]['mean']==4.25
 
-def test_generation_validation_unrated_and_idempotent(setup):
-    c,engine=setup
-    register(c)
-    week=monday(datetime.now(MANILA).date())+timedelta(weeks=1)
-    assert mutate(c,'/api/assignments/generate',{'start_date':str(week+timedelta(days=1))}).status_code==422
-    cid=mutate(c,'/api/chores',{'name':'Unrated','due_weekday':1}).json()['chore_id']
-    response=mutate(c,'/api/assignments/generate',{'start_date':str(week)})
-    assert response.status_code==409 and 'Unrated' in response.json()['detail']
-    mutate(c,f'/api/chores/{cid}/rating',{'intensity_rating':3},'PUT')
-    result=mutate(c,'/api/assignments/generate',{'start_date':str(week)}).json()
-    assert result['warnings'] and not result['assignments']
-    mutate(c,'/api/availability',{'days':[True]*7},'PUT')
-    first=mutate(c,'/api/assignments/generate',{'start_date':str(week)}).json()['assignments']
-    mutate(c,f'/api/chores/{cid}/rating',{'intensity_rating':5},'PUT')
-    assert mutate(c,'/api/assignments/generate',{'start_date':str(week)}).json()['assignments']==first
+def test_availability_owned_and_explicit(client,login,populated):
+    assert client.put('/api/availability',json={'days':[False]*7}).status_code==200
+    assert client.get('/api/availability').json()['days']==[False]*7
+    assert client.put('/api/availability',json={'days':[True]}).status_code==422
+    assert client.put('/api/availability',json={'days':[True]*7,'resident_id':2}).status_code==422
+    login('bea')
+    assert client.get('/api/availability').json()['days']==[True]*7
 
-def test_full_delegation_completion_and_reporting(setup):
-    c,engine=setup
-    cid,week,a=prepare(c)
+def test_csrf_and_origin(client,login):
+    token=client.headers.pop('X-CSRF-Token')
+    assert client.put('/api/availability',json={'days':[False]*7}).status_code==403
+    client.headers['X-CSRF-Token']=token
+    assert client.put('/api/availability',json={'days':[False]*7},headers={'Origin':'https://evil.invalid'}).status_code==403
+
+def test_generate_api_and_completion_authorization(client,login,populated):
+    start=core.monday(core.today())+timedelta(weeks=1)
+    response=client.post('/api/weeks/generate',json={'start_date':start.isoformat()})
+    assert response.status_code==200,response.text
+    tasks=client.get('/api/assignments',params={'start':str(start)}).json()
+    assert len(tasks)==4
+    a=next(a for a in tasks if a['resident_id']!=1)
+    assert client.post(f"/api/assignments/{a['assignment_id']}/complete").status_code==403
+    assert client.post('/api/weeks/generate',json={'start_date':str(start)}).json()['created']==[]
+    assert client.post('/api/weeks/generate',json={'start_date':'2020-01-06'}).status_code==422
+
+def test_directory_status_privacy_and_delegation_inbox(client,login,populated):
+    start=core.monday(core.today())
+    client.post('/api/weeks/generate',json={'start_date':str(start)})
+    tasks=client.get('/api/assignments',params={'start':str(start)}).json()
+    a=next(a for a in tasks if a['resident_id']==1)
     aid=a['assignment_id']
-    requested=mutate(c,f'/api/assignments/{aid}/delegations',{'substitute_resident_id':2,'reason':'Study group'})
-    assert requested.status_code==201,requested.text
-    did=requested.json()['delegation_id']
-    assert mutate(c,f'/api/assignments/{aid}/delegations',{'substitute_resident_id':2,'reason':'Again'}).status_code==409
-    assert mutate(c,f'/api/delegations/{did}/respond',{'status':'accepted'}).status_code==403
-    login(c,'bea')
-    assert c.get('/api/delegations').json()[0]['status']=='pending'
-    assert mutate(c,f'/api/assignments/{aid}/complete').status_code==403
-    assert mutate(c,f'/api/delegations/{did}/respond',{'status':'accepted'}).status_code==200
-    assert mutate(c,f'/api/assignments/{aid}/complete').status_code==200
-    stats=c.get('/api/statistics',params={'start_date':str(week)}).json()['residents']
-    assert stats[0]['original']==5 and stats[0]['actual']==0
-    assert stats[1]['actual']==5 and stats[1]['completed']==5
-    with Session(engine) as db:
-        assert db.get(Assignment,aid).resident_id==1
-        view=db.execute(text('SELECT * FROM weekly_workload ORDER BY resident_id')).mappings().all()
-        assert view[0]['originally_assigned']==5 and view[0]['actual_responsibility']==0
-        assert view[1]['actual_responsibility']==5 and view[1]['completed']==5
-    login(c,'alex')
-    assert mutate(c,f'/api/assignments/{aid}/complete').status_code==403
+    d=client.post(f'/api/assignments/{aid}/delegations',json={'substitute_resident_id':2,'reason':'PRIVATE REASON'})
+    assert d.status_code==200,d.text
+    did=d.json()['delegation_id']
+    assert client.patch(f'/api/delegations/{did}',json={'status':'accepted'}).status_code==403
+    login('carlo')
+    assert client.get('/api/delegations').json()==[]
+    assert 'PRIVATE REASON' not in client.get('/api/residents/1/status',params={'start':str(start)}).text
+    assert 'password' not in client.get('/api/residents').text
+    assert client.get(f'/api/assignments/{aid}/substitutes').status_code==403
+    assert client.get('/api/me').json()['name']=='Carlo'
+    login('bea')
+    assert client.patch(f'/api/delegations/{did}',json={'status':'accepted'}).status_code==200
+    assert client.post(f'/api/assignments/{aid}/complete').status_code==200
+    updated=client.get(f'/api/assignments/{aid}').json()
+    assert updated['resident_id']==1 and updated['responsible_id']==2
 
-def test_database_migration_constraints_and_chore_history(setup):
-    c,engine=setup
-    cid,week,a=prepare(c)
-    assert len([t for t in inspect(engine).get_table_names() if t!='alembic_version'])==7
-    assert 'weekly_workload' in inspect(engine).get_view_names()
-    assert mutate(c,f'/api/chores/{cid}',{'name':'Bathroom','due_weekday':2},'PUT').status_code==409
-    assert mutate(c,f'/api/chores/{cid}',{'name':'Bathroom','due_weekday':4,'is_active':False},'PUT').status_code==200
-    from sqlalchemy.exc import IntegrityError
-    with engine.begin() as conn:
-        with pytest.raises(IntegrityError):conn.execute(text("UPDATE assignment SET due_date='2026-01-01'"))
-    assert c.get('/').status_code==200
-    assert c.get('/static/app.js').status_code==200
-    assert "frame-ancestors 'none'" in c.get('/').headers['content-security-policy']
+def test_chore_crud_and_weekday_history_policy(client,login):
+    response=client.post('/api/chores',json={'name':'Tidy shelf','due_weekday':3})
+    assert response.status_code==200
+    cid=response.json()['chore_id']
+    assert client.put(f'/api/chores/{cid}',json={'name':'Tidy shelves','due_weekday':5}).status_code==200
+    assert client.post('/api/chores',json={'name':'Invalid','due_weekday':2,'frequency':'daily'}).status_code==422
+    assert client.post('/api/weeks/generate',json={'start_date':str(core.monday(core.today()))}).status_code==422
+    assert client.put(f'/api/chores/{cid}/rating',json={'intensity_rating':3}).status_code==200
+    client.post('/api/weeks/generate',json={'start_date':str(core.monday(core.today()))})
+    assert client.put(f'/api/chores/{cid}',json={'name':'Tidy shelves','due_weekday':6}).status_code==409
+    assert client.put(f'/api/chores/{cid}',json={'name':'Tidy shelves','due_weekday':5,'is_active':False}).status_code==200
 
-def test_simultaneous_generations_do_not_duplicate(setup):
-    c,engine=setup
-    _,week,_=prepare(c)
-    cookies=dict(c.cookies)
-    csrf=c.get('/api/session').json()['csrf']
-    def run(_):
-        with TestClient(app) as client:
-            client.cookies.update(cookies)
-            return client.post('/api/assignments/generate',json={'start_date':str(week)},headers={'X-CSRF-Token':csrf}).status_code
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        assert list(pool.map(run,range(2)))==[200,200]
-    with Session(engine) as db:
-        assert len(list(db.scalars(select(Assignment))))==1
+def test_inactive_login_blocked(client,populated):
+    populated.get(Resident,1).is_active=False;populated.commit()
+    assert client.post('/api/auth/login',json={'username':'alex','password':'Dormie2026!'}).status_code==401
 
-def test_rejected_cancelled_history_and_acceptance_revalidation(setup):
-    c,engine=setup
-    _,_,a=prepare(c)
-    aid=a['assignment_id']
-    def request():
-        response=mutate(c,f'/api/assignments/{aid}/delegations',{'substitute_resident_id':2,'reason':'Unexpected commitment'})
-        assert response.status_code==201,response.text
-        return response.json()['delegation_id']
-    first=request()
-    login(c,'bea')
-    assert mutate(c,f'/api/delegations/{first}/respond',{'status':'rejected'}).status_code==200
-    login(c,'alex')
-    second=request()
-    assert mutate(c,f'/api/delegations/{second}/respond',{'status':'cancelled'}).status_code==200
-    third=request()
-    login(c,'bea')
-    mutate(c,'/api/availability',{'days':[False]*7},'PUT')
-    assert mutate(c,f'/api/delegations/{third}/respond',{'status':'accepted'}).status_code==409
-    assert [d['status'] for d in c.get('/api/delegations').json()]==['pending','cancelled','rejected']
+def test_rendered_page_and_assets(client):
+    assert client.get('/').status_code==200
+    assert 'Dormie' in client.get('/').text
+    assert client.get('/static/app.js').status_code==200
+    assert client.get('/static/assets/resident-0.svg').status_code==200
+
+
+def test_retired_chore_rejects_rating_updates(client,login,populated):
+    chore=populated.get(Chore,1)
+    chore.is_active=False
+    populated.commit()
+    response=client.put('/api/chores/1/rating',json={'intensity_rating':5})
+    assert response.status_code==409
+    assert 'Retired chores' in response.json()['detail']
